@@ -12,6 +12,7 @@ import time
 import json
 import os
 import logging
+import random
 from bs4 import BeautifulSoup
 
 # ============================================================
@@ -28,7 +29,7 @@ SEARCHES = [
         "prezzo_min":    5,
         "prezzo_max":    100,
         "prezzo_revend": 200,
-        "regione":       None,  # tutta Italia
+        "regione":       None,
         "categoria":     None,
     },
     {
@@ -37,7 +38,7 @@ SEARCHES = [
         "prezzo_min":    5,
         "prezzo_max":    50,
         "prezzo_revend": 150,
-        "regione":       None,  # tutta Italia
+        "regione":       None,
         "categoria":     None,
     },
 ]
@@ -77,6 +78,41 @@ def save_seen(seen: set):
         log.error(f"Errore salvataggio seen: {e}")
 
 # ============================================================
+#  Sessione HTTP con headers realistici
+# ============================================================
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+]
+
+def make_session() -> requests.Session:
+    session = requests.Session()
+    ua = random.choice(USER_AGENTS)
+    session.headers.update({
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+    })
+    # Prima visita la home per ottenere cookie
+    try:
+        session.get("https://www.subito.it", timeout=10)
+        time.sleep(random.uniform(1.5, 3.0))
+    except Exception:
+        pass
+    return session
+
+# ============================================================
 #  URL Builder
 # ============================================================
 
@@ -100,21 +136,12 @@ def build_url(search: dict) -> str:
 #  Scraping
 # ============================================================
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "it-IT,it;q=0.9",
-}
-
-def scrape_annunci(search: dict) -> list:
+def scrape_annunci(session: requests.Session, search: dict) -> list:
     url = build_url(search)
     log.info(f"[{search['nome']}] Scraping: {url}")
 
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = session.get(url, timeout=15)
         resp.raise_for_status()
     except requests.RequestException as e:
         log.error(f"[{search['nome']}] Errore HTTP: {e}")
@@ -185,7 +212,7 @@ def parse_price(text: str):
 def passes_filter(annuncio: dict, search: dict) -> bool:
     price = annuncio["price"]
     if price is None:
-        return True  # se non ha prezzo lo segnaliamo comunque
+        return True
     if search.get("prezzo_max") is not None and price > search["prezzo_max"]:
         return False
     if search.get("prezzo_min") is not None and price < search["prezzo_min"]:
@@ -193,7 +220,7 @@ def passes_filter(annuncio: dict, search: dict) -> bool:
     return True
 
 # ============================================================
-#  Calcolo margine
+#  Margine
 # ============================================================
 
 def calcola_margine(price, prezzo_revend):
@@ -223,18 +250,17 @@ def escape_md(text: str) -> str:
     return "".join(f"\\{c}" if c in special else c for c in str(text))
 
 def send_telegram(annuncio: dict, search: dict):
-    price      = annuncio["price"]
-    prezzo_txt = annuncio["price_text"] or "Prezzo non indicato"
-    luogo      = annuncio["location"] or "—"
-    data       = annuncio["date"] or "—"
-    margine    = calcola_margine(price, search.get("prezzo_revend"))
+    price       = annuncio["price"]
+    prezzo_txt  = annuncio["price_text"] or "Prezzo non indicato"
+    luogo       = annuncio["location"] or "—"
+    data        = annuncio["date"] or "—"
+    margine     = calcola_margine(price, search.get("prezzo_revend"))
     valutazione = valuta_affare(margine, search.get("prezzo_revend"))
 
-    # Riga margine
     if margine is not None:
         margine_txt = f"💰 Margine stimato: ~{int(margine)}€ \\(rivendi a ~{search['prezzo_revend']}€\\)"
     else:
-        margine_txt = "💰 Margine: non calcolabile \\(prezzo assente\\)"
+        margine_txt = "💰 Margine: non calcolabile"
 
     text = (
         f"{valutazione}\n"
@@ -285,9 +311,11 @@ def send_startup_message():
 def check_all():
     seen = load_seen()
     new_count = 0
+    session = make_session()
 
     for search in SEARCHES:
-        for ann in scrape_annunci(search):
+        annunci = scrape_annunci(session, search)
+        for ann in annunci:
             ad_id = f"{search['nome']}_{ann['id']}"
             if ad_id in seen:
                 continue
@@ -299,6 +327,8 @@ def check_all():
             seen.add(ad_id)
             new_count += 1
             time.sleep(1)
+        # Pausa casuale tra una ricerca e l'altra
+        time.sleep(random.uniform(2.0, 4.0))
 
     save_seen(seen)
     log.info(f"✔ Check completato — {new_count} nuovi annunci notificati")
