@@ -1,93 +1,141 @@
-def fetch_via_apify(search: dict) -> list:
-    log.info(f"[{search['nome']}] Avvio run Apify...")
+#!/usr/bin/env python3
+import requests
+import time
+import json
+import os
+import logging
 
-    actor = "santamaria-automations~subito-it-scraper"
+# ================= CONFIG =================
 
-    # STEP 1 — Avvia run
-    run_url = f"https://api.apify.com/v2/acts/{actor}/runs"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+APIFY_API_KEY      = os.environ.get("APIFY_API_KEY", "")
+
+INTERVALLO = 300  # 5 minuti
+
+SEARCHES = [
+    {
+        "nome": "Nintendo 3DS XL",
+        "url": "https://www.subito.it/annunci/italia/vendita/?q=nintendo+3ds+xl&ps=5&pe=130",
+        "prezzo_max": 130,
+        "prezzo_revend": 200,
+    },
+    {
+        "nome": "Nintendo 3DS",
+        "url": "https://www.subito.it/annunci/italia/vendita/?q=nintendo+3ds&ps=5&pe=70",
+        "prezzo_max": 70,
+        "prezzo_revend": 150,
+    },
+]
+
+APIFY_ACTOR = "santamaria-automations~subito-it-scraper"
+
+# ================= LOGGING =================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger(__name__)
+
+# ================= VALIDAZIONE =================
+
+def validate():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not APIFY_API_KEY:
+        raise Exception("❌ Variabili ambiente mancanti")
+
+# ================= APIFY =================
+
+def fetch(search):
+    log.info(f"🔎 Avvio Apify: {search['nome']}")
+
+    url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync"
     params = {"token": APIFY_API_KEY}
+
     payload = {
         "startUrls": [{"url": search["url"]}],
-        "maxItems": 50,
+        "maxItems": 30
     }
 
     try:
-        run_resp = requests.post(run_url, params=params, json=payload, timeout=30)
-        run_resp.raise_for_status()
-        run_data = run_resp.json()
+        r = requests.post(url, params=params, json=payload, timeout=120)
+        r.raise_for_status()
+        items = r.json()
     except Exception as e:
-        log.error(f"[{search['nome']}] Errore avvio run: {e}")
+        log.error(f"❌ Apify error: {e}")
         return []
 
-    run_id = run_data["data"]["id"]
-    log.info(f"[{search['nome']}] Run avviato: {run_id}")
-
-    # STEP 2 — Attendi completamento
-    status_url = f"https://api.apify.com/v2/actor-runs/{run_id}"
-    
-    for _ in range(20):  # max ~100 secondi
-        try:
-            status_resp = requests.get(status_url, params=params, timeout=10)
-            status_resp.raise_for_status()
-            status = status_resp.json()["data"]["status"]
-
-            if status == "SUCCEEDED":
-                dataset_id = status_resp.json()["data"]["defaultDatasetId"]
-                break
-            elif status in ["FAILED", "ABORTED", "TIMED-OUT"]:
-                log.error(f"[{search['nome']}] Run fallito: {status}")
-                return []
-
-            time.sleep(5)
-        except Exception as e:
-            log.warning(f"Errore polling run: {e}")
-            time.sleep(5)
-    else:
-        log.error(f"[{search['nome']}] Timeout run")
+    if not isinstance(items, list):
+        log.error(f"❌ Risposta Apify non valida: {items}")
         return []
 
-    # STEP 3 — Recupera dataset
-    dataset_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
+    log.info(f"📦 Trovati {len(items)} items")
+    return items
 
+# ================= TELEGRAM =================
+
+def send(text):
     try:
-        data_resp = requests.get(dataset_url, params=params, timeout=30)
-        data_resp.raise_for_status()
-        items = data_resp.json()
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text
+            },
+            timeout=10
+        )
     except Exception as e:
-        log.error(f"[{search['nome']}] Errore fetch dataset: {e}")
-        return []
+        log.error(f"❌ Telegram error: {e}")
 
-    log.info(f"[{search['nome']}] Trovati {len(items)} annunci")
+# ================= LOGICA =================
 
-    annunci = []
-    for item in items:
-        try:
-            title = item.get("title") or item.get("name") or "Senza titolo"
-            link = item.get("url") or item.get("link") or ""
-            price = item.get("price") or item.get("priceValue")
+seen = set()
 
-            if isinstance(price, str):
-                price = parse_price(price)
-            elif isinstance(price, (int, float)):
-                price = float(price)
+def check():
+    global seen
 
-            price_text = f"{int(price)} €" if price else item.get("priceText", "Prezzo non indicato")
+    for s in SEARCHES:
+        items = fetch(s)
 
-            location = item.get("location") or item.get("city") or ""
-            date_str = item.get("date") or item.get("publishedAt") or ""
+        for i in items:
+            title = i.get("title") or "No title"
+            url = i.get("url") or ""
+            price = i.get("price")
 
-            ad_id = link.split("-")[-1].rstrip("/") if link else title
+            key = url or title
+            if key in seen:
+                continue
 
-            annunci.append({
-                "id": ad_id,
-                "title": title,
-                "price": price,
-                "price_text": price_text,
-                "link": link,
-                "location": location,
-                "date": date_str,
-            })
-        except Exception as e:
-            log.warning(f"Errore parsing item: {e}")
+            seen.add(key)
 
-    return annunci
+            msg = f"""🔥 NUOVO AFFARE
+{s['nome']}
+
+📦 {title}
+💶 {price}
+🔗 {url}
+"""
+
+            log.info(f"📢 NUOVO: {title}")
+            send(msg)
+
+# ================= MAIN =================
+
+if __name__ == "__main__":
+    try:
+        print(">>> BOT STARTED")
+
+        validate()
+
+        log.info("🤖 Bot avviato")
+
+        while True:
+            try:
+                check()
+            except Exception as e:
+                log.error(f"⚠️ Errore check: {e}")
+
+            time.sleep(INTERVALLO)
+
+    except Exception as e:
+        log.error(f"💥 CRASH FATALE: {e}")
