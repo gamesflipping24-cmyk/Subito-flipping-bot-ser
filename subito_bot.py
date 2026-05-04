@@ -2,8 +2,8 @@
 """
 Bot Telegram — Monitor Subito.it per Flipping
 ==============================================
-Monitora subito.it ogni 2 minuti e invia notifiche Telegram
-con margine di guadagno stimato per ogni annuncio trovato.
+Usa il feed RSS ufficiale di Subito.it per evitare blocchi 403.
+Monitora ogni 2 minuti e invia notifiche Telegram con margine stimato.
 """
 
 import requests
@@ -13,7 +13,8 @@ import json
 import os
 import logging
 import random
-from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
+from urllib.parse import quote
 
 # ============================================================
 #  ⚙️  CONFIG
@@ -29,8 +30,6 @@ SEARCHES = [
         "prezzo_min":    5,
         "prezzo_max":    130,
         "prezzo_revend": 200,
-        "regione":       None,
-        "categoria":     None,
     },
     {
         "nome":          "Nintendo 3DS",
@@ -38,8 +37,6 @@ SEARCHES = [
         "prezzo_min":    5,
         "prezzo_max":    70,
         "prezzo_revend": 150,
-        "regione":       None,
-        "categoria":     None,
     },
 ]
 
@@ -78,131 +75,103 @@ def save_seen(seen: set):
         log.error(f"Errore salvataggio seen: {e}")
 
 # ============================================================
-#  Sessione HTTP con headers realistici
+#  Fetch RSS Subito.it
 # ============================================================
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-]
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; RSS reader)",
+    "Accept": "application/rss+xml, application/xml, text/xml",
+}
 
-def make_session() -> requests.Session:
-    session = requests.Session()
-    ua = random.choice(USER_AGENTS)
-    session.headers.update({
-        "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0",
-    })
-    try:
-        session.get("https://www.subito.it", timeout=10)
-        time.sleep(random.uniform(1.5, 3.0))
-    except Exception:
-        pass
-    return session
+def build_rss_url(search: dict) -> str:
+    q = quote(search["query"])
+    url = f"https://www.subito.it/annunci/italia/vendita/?q={q}&ps={search['prezzo_min']}&pe={search['prezzo_max']}&output=rss"
+    return url
 
-# ============================================================
-#  URL Builder
-# ============================================================
-
-def build_url(search: dict) -> str:
-    path_parts = ["annunci"]
-    path_parts.append(search["regione"] if search.get("regione") else "italia")
-    if search.get("categoria"):
-        path_parts.append(search["categoria"])
-    path = "/".join(path_parts) + "/"
-
-    params = {"q": search["query"]}
-    if search.get("prezzo_min") is not None:
-        params["ps"] = search["prezzo_min"]
-    if search.get("prezzo_max") is not None:
-        params["pe"] = search["prezzo_max"]
-
-    query_string = "&".join(f"{k}={v}" for k, v in params.items())
-    return f"https://www.subito.it/{path}?{query_string}"
-
-# ============================================================
-#  Scraping
-# ============================================================
-
-def scrape_annunci(session: requests.Session, search: dict) -> list:
-    url = build_url(search)
-    log.info(f"[{search['nome']}] Scraping: {url}")
+def fetch_rss(search: dict) -> list:
+    url = build_rss_url(search)
+    log.info(f"[{search['nome']}] RSS: {url}")
 
     try:
-        resp = session.get(url, timeout=15)
+        resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
     except requests.RequestException as e:
-        log.error(f"[{search['nome']}] Errore HTTP: {e}")
+        log.error(f"[{search['nome']}] Errore RSS: {e}")
         return []
 
-    soup = BeautifulSoup(resp.text, "html.parser")
     annunci = []
+    try:
+        root = ET.fromstring(resp.content)
+        channel = root.find("channel")
+        if channel is None:
+            log.warning(f"[{search['nome']}] Nessun channel nel RSS")
+            return []
 
-    cards = soup.select("article[class*='item-card']")
-    if not cards:
-        cards = soup.select("div[class*='item-list'] article")
+        items = channel.findall("item")
+        log.info(f"[{search['nome']}] Trovati {len(items)} annunci nel RSS")
 
-    for card in cards:
-        try:
-            ad_id = card.get("data-item-id") or card.get("id") or ""
-            if not ad_id:
-                link_tag = card.select_one("a[href*='/annunci/']")
-                if link_tag:
-                    ad_id = link_tag["href"].split("-")[-1].rstrip("/")
-            if not ad_id:
-                continue
+        for item in items:
+            try:
+                title    = item.findtext("title", "").strip()
+                link     = item.findtext("link", "").strip()
+                desc     = item.findtext("description", "").strip()
+                pub_date = item.findtext("pubDate", "").strip()
+                guid     = item.findtext("guid", link).strip()
 
-            title_tag = card.select_one("h2,h3,[class*='title']")
-            title = title_tag.get_text(strip=True) if title_tag else "Senza titolo"
+                # Estrai ID univoco dal link o guid
+                ad_id = guid.split("-")[-1].rstrip("/") if guid else link
 
-            price_tag = card.select_one("[class*='price']")
-            price_text = price_tag.get_text(strip=True) if price_tag else ""
-            price = parse_price(price_text)
+                # Estrai prezzo dalla descrizione o dal titolo
+                price, price_text = extract_price(desc + " " + title)
 
-            link_tag = card.select_one("a[href]")
-            link = link_tag["href"] if link_tag else ""
-            if link and not link.startswith("http"):
-                link = "https://www.subito.it" + link
+                # Estrai città dalla descrizione
+                location = extract_location(desc)
 
-            location_tag = card.select_one("[class*='town'],[class*='location'],[class*='city']")
-            location = location_tag.get_text(strip=True) if location_tag else ""
+                annunci.append({
+                    "id":         ad_id,
+                    "title":      title,
+                    "price":      price,
+                    "price_text": price_text,
+                    "link":       link,
+                    "location":   location,
+                    "date":       pub_date,
+                })
+            except Exception as e:
+                log.warning(f"Errore parsing item RSS: {e}")
 
-            date_tag = card.select_one("[class*='date'],[class*='time']")
-            date_str = date_tag.get_text(strip=True) if date_tag else ""
+    except ET.ParseError as e:
+        log.error(f"[{search['nome']}] Errore parsing XML: {e}")
 
-            annunci.append({
-                "id":         ad_id,
-                "title":      title,
-                "price":      price,
-                "price_text": price_text,
-                "link":       link,
-                "location":   location,
-                "date":       date_str,
-            })
-        except Exception as e:
-            log.warning(f"Errore parsing card: {e}")
-
-    log.info(f"[{search['nome']}] Trovati {len(annunci)} annunci")
     return annunci
 
-def parse_price(text: str):
-    try:
-        cleaned = text.replace(".", "").replace(",", ".").replace("€", "").strip()
-        num = "".join(c for c in cleaned if c.isdigit() or c == ".")
-        return float(num) if num else None
-    except Exception:
-        return None
+def extract_price(text: str):
+    """Estrae il prezzo da una stringa di testo."""
+    import re
+    # Cerca pattern tipo "80 €", "80€", "€ 80", "80,00 €"
+    patterns = [
+        r'(\d{1,4}(?:[.,]\d{1,3})?)\s*€',
+        r'€\s*(\d{1,4}(?:[.,]\d{1,3})?)',
+        r'Prezzo[:\s]+(\d{1,4}(?:[.,]\d{1,3})?)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            raw = match.group(1).replace(".", "").replace(",", ".")
+            try:
+                price = float(raw)
+                return price, f"{int(price)} €"
+            except ValueError:
+                pass
+    return None, ""
+
+def extract_location(desc: str) -> str:
+    """Tenta di estrarre la città dalla descrizione HTML."""
+    import re
+    # Spesso nella descrizione c'è qualcosa tipo "Milano (MI)"
+    match = re.search(r'([A-Z][a-zàèéìòù]+(?:\s[A-Z][a-zàèéìòù]+)?)\s*\([A-Z]{2}\)', desc)
+    if match:
+        return match.group(0)
+    return ""
 
 # ============================================================
 #  Filtro
@@ -211,7 +180,7 @@ def parse_price(text: str):
 def passes_filter(annuncio: dict, search: dict) -> bool:
     price = annuncio["price"]
     if price is None:
-        return True
+        return True  # senza prezzo lo notifichiamo comunque
     if search.get("prezzo_max") is not None and price > search["prezzo_max"]:
         return False
     if search.get("prezzo_min") is not None and price < search["prezzo_min"]:
@@ -289,8 +258,8 @@ def send_startup_message():
         for s in SEARCHES
     )
     text = (
-        f"🤖 *Bot Subito\\.it aggiornato e riavviato\\!*\n\n"
-        f"🎮 Monitorando ogni *{INTERVALLO_MINUTI} minuti*:\n"
+        f"🤖 *Bot Subito\\.it aggiornato\\!*\n\n"
+        f"🎮 Monitorando ogni *{INTERVALLO_MINUTI} minuti* via RSS:\n"
         f"{lines}\n\n"
         f"Ti avviserò non appena trovo un affare\\! 🔥"
     )
@@ -310,10 +279,9 @@ def send_startup_message():
 def check_all():
     seen = load_seen()
     new_count = 0
-    session = make_session()
 
     for search in SEARCHES:
-        annunci = scrape_annunci(session, search)
+        annunci = fetch_rss(search)
         for ann in annunci:
             ad_id = f"{search['nome']}_{ann['id']}"
             if ad_id in seen:
@@ -326,7 +294,7 @@ def check_all():
             seen.add(ad_id)
             new_count += 1
             time.sleep(1)
-        time.sleep(random.uniform(2.0, 4.0))
+        time.sleep(random.uniform(1.5, 3.0))
 
     save_seen(seen)
     log.info(f"✔ Check completato — {new_count} nuovi annunci notificati")
@@ -341,7 +309,7 @@ def validate_config():
 
 if __name__ == "__main__":
     log.info("=" * 50)
-    log.info("🎮 Bot Subito.it Flipping avviato")
+    log.info("🎮 Bot Subito.it Flipping avviato (RSS)")
     validate_config()
     log.info(f"Ricerche: {[s['nome'] for s in SEARCHES]}")
     log.info(f"Intervallo: ogni {INTERVALLO_MINUTI} minuti")
