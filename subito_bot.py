@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Bot Telegram — Monitor Subito.it per Flipping
-==============================================
-Monitora subito.it ogni 2 minuti e invia notifiche Telegram
-con margine di guadagno stimato per ogni annuncio trovato.
+Bot Telegram — Monitor Subito.it per Flipping via Apify
+========================================================
+Usa Apify per bypassare i blocchi di Subito.it.
+Monitora ogni 5 minuti e invia notifiche Telegram con margine stimato.
 """
 
 import requests
@@ -12,8 +12,6 @@ import time
 import json
 import os
 import logging
-import random
-from bs4 import BeautifulSoup
 
 # ============================================================
 #  CONFIG
@@ -21,30 +19,30 @@ from bs4 import BeautifulSoup
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+APIFY_API_KEY      = os.environ.get("APIFY_API_KEY", "")
 
 SEARCHES = [
     {
         "nome":          "Nintendo 3DS XL",
-        "query":         "nintendo 3ds xl",
+        "url":           "https://www.subito.it/annunci/italia/vendita/?q=nintendo+3ds+xl&ps=5&pe=130",
         "prezzo_min":    5,
         "prezzo_max":    130,
         "prezzo_revend": 200,
-        "regione":       None,
-        "categoria":     None,
     },
     {
         "nome":          "Nintendo 3DS",
-        "query":         "nintendo 3ds",
+        "url":           "https://www.subito.it/annunci/italia/vendita/?q=nintendo+3ds&ps=5&pe=70",
         "prezzo_min":    5,
         "prezzo_max":    70,
         "prezzo_revend": 150,
-        "regione":       None,
-        "categoria":     None,
     },
 ]
 
-INTERVALLO_MINUTI = 2
+INTERVALLO_MINUTI = 5
 SEEN_FILE = "/tmp/seen_ids.json"
+
+# Apify actor per Subito.it
+APIFY_ACTOR = "santamaria-automations/subito-it-scraper"
 
 # ============================================================
 #  Logging
@@ -78,103 +76,49 @@ def save_seen(seen: set):
         log.error(f"Errore salvataggio seen: {e}")
 
 # ============================================================
-#  Sessione HTTP
+#  Apify scraper
 # ============================================================
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-]
+def fetch_via_apify(search: dict) -> list:
+    log.info(f"[{search['nome']}] Chiamata Apify...")
 
-def make_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0",
-    })
+    # Avvia il run dell'actor
+    run_url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items"
+    params  = {"token": APIFY_API_KEY}
+    payload = {
+        "startUrls": [search["url"]],
+        "maxItems":  50,
+    }
+
     try:
-        session.get("https://www.subito.it", timeout=10)
-        time.sleep(random.uniform(1.5, 3.0))
-    except Exception:
-        pass
-    return session
-
-# ============================================================
-#  URL Builder
-# ============================================================
-
-def build_url(search: dict) -> str:
-    path_parts = ["annunci"]
-    path_parts.append(search["regione"] if search.get("regione") else "italia")
-    if search.get("categoria"):
-        path_parts.append(search["categoria"])
-    path = "/".join(path_parts) + "/"
-    params = {"q": search["query"]}
-    if search.get("prezzo_min") is not None:
-        params["ps"] = search["prezzo_min"]
-    if search.get("prezzo_max") is not None:
-        params["pe"] = search["prezzo_max"]
-    query_string = "&".join(f"{k}={v}" for k, v in params.items())
-    return f"https://www.subito.it/{path}?{query_string}"
-
-# ============================================================
-#  Scraping
-# ============================================================
-
-def scrape_annunci(session: requests.Session, search: dict) -> list:
-    url = build_url(search)
-    log.info(f"[{search['nome']}] Scraping: {url}")
-    try:
-        resp = session.get(url, timeout=15)
+        resp = requests.post(run_url, params=params, json=payload, timeout=120)
         resp.raise_for_status()
+        items = resp.json()
     except requests.RequestException as e:
-        log.error(f"[{search['nome']}] Errore HTTP: {e}")
+        log.error(f"[{search['nome']}] Errore Apify: {e}")
         return []
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    log.info(f"[{search['nome']}] Apify ha restituito {len(items)} annunci")
+
     annunci = []
-    cards = soup.select("article[class*='item-card']")
-    if not cards:
-        cards = soup.select("div[class*='item-list'] article")
-
-    for card in cards:
+    for item in items:
         try:
-            ad_id = card.get("data-item-id") or card.get("id") or ""
-            if not ad_id:
-                link_tag = card.select_one("a[href*='/annunci/']")
-                if link_tag:
-                    ad_id = link_tag["href"].split("-")[-1].rstrip("/")
-            if not ad_id:
-                continue
+            # Estrai i campi dal JSON di Apify
+            title      = item.get("title") or item.get("name") or "Senza titolo"
+            link       = item.get("url") or item.get("link") or ""
+            price      = item.get("price") or item.get("priceValue") or None
+            price_text = f"{int(price)} €" if price else item.get("priceText", "Prezzo non indicato")
+            location   = item.get("location") or item.get("city") or ""
+            date_str   = item.get("date") or item.get("publishedAt") or ""
 
-            title_tag = card.select_one("h2,h3,[class*='title']")
-            title = title_tag.get_text(strip=True) if title_tag else "Senza titolo"
+            # ID univoco dall'URL
+            ad_id = link.split("-")[-1].rstrip("/") if link else title
 
-            price_tag = card.select_one("[class*='price']")
-            price_text = price_tag.get_text(strip=True) if price_tag else ""
-            price = parse_price(price_text)
-
-            link_tag = card.select_one("a[href]")
-            link = link_tag["href"] if link_tag else ""
-            if link and not link.startswith("http"):
-                link = "https://www.subito.it" + link
-
-            location_tag = card.select_one("[class*='town'],[class*='location'],[class*='city']")
-            location = location_tag.get_text(strip=True) if location_tag else ""
-
-            date_tag = card.select_one("[class*='date'],[class*='time']")
-            date_str = date_tag.get_text(strip=True) if date_tag else ""
+            # Converti prezzo in float se stringa
+            if isinstance(price, str):
+                price = parse_price(price)
+            elif isinstance(price, (int, float)):
+                price = float(price)
 
             annunci.append({
                 "id":         ad_id,
@@ -186,14 +130,13 @@ def scrape_annunci(session: requests.Session, search: dict) -> list:
                 "date":       date_str,
             })
         except Exception as e:
-            log.warning(f"Errore parsing card: {e}")
+            log.warning(f"Errore parsing item Apify: {e}")
 
-    log.info(f"[{search['nome']}] Trovati {len(annunci)} annunci")
     return annunci
 
 def parse_price(text: str):
     try:
-        cleaned = text.replace(".", "").replace(",", ".").replace("€", "").strip()
+        cleaned = str(text).replace(".", "").replace(",", ".").replace("€", "").strip()
         num = "".join(c for c in cleaned if c.isdigit() or c == ".")
         return float(num) if num else None
     except Exception:
@@ -284,7 +227,7 @@ def send_startup_message():
         for s in SEARCHES
     )
     text = (
-        f"🤖 *Bot Subito\\.it riavviato\\!*\n\n"
+        f"🤖 *Bot Subito\\.it riavviato con Apify\\!*\n\n"
         f"🎮 Monitorando ogni *{INTERVALLO_MINUTI} minuti*:\n"
         f"{lines}\n\n"
         f"Ti avviserò non appena trovo un affare\\! 🔥"
@@ -305,10 +248,9 @@ def send_startup_message():
 def check_all():
     seen = load_seen()
     new_count = 0
-    session = make_session()
 
     for search in SEARCHES:
-        annunci = scrape_annunci(session, search)
+        annunci = fetch_via_apify(search)
         for ann in annunci:
             ad_id = f"{search['nome']}_{ann['id']}"
             if ad_id in seen:
@@ -321,7 +263,6 @@ def check_all():
             seen.add(ad_id)
             new_count += 1
             time.sleep(1)
-        time.sleep(random.uniform(2.0, 4.0))
 
     save_seen(seen)
     log.info(f"✔ Check completato — {new_count} nuovi annunci notificati")
@@ -333,10 +274,13 @@ def validate_config():
     if not TELEGRAM_CHAT_ID:
         log.error("❌ TELEGRAM_CHAT_ID non impostato!")
         exit(1)
+    if not APIFY_API_KEY:
+        log.error("❌ APIFY_API_KEY non impostato!")
+        exit(1)
 
 if __name__ == "__main__":
     log.info("=" * 50)
-    log.info("🎮 Bot Subito.it Flipping avviato")
+    log.info("🎮 Bot Subito.it Flipping avviato con Apify")
     validate_config()
     log.info(f"Ricerche: {[s['nome'] for s in SEARCHES]}")
     log.info(f"Intervallo: ogni {INTERVALLO_MINUTI} minuti")
