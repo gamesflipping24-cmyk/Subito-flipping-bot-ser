@@ -402,6 +402,29 @@ def check_all():
     save_seen(seen)
     log.info(f"✔ Check completato — {new_count} nuovi annunci notificati")
 
+def get_public_ip():
+    """Recupera l'IP pubblico usato dal bot per le richieste."""
+    try:
+        # Prima prova senza proxy (IP di Railway)
+        r = requests.get("https://api.ipify.org?format=json", timeout=10)
+        ip_railway = r.json().get("ip", "sconosciuto")
+        log.info(f"🌐 IP Railway (senza proxy): {ip_railway}")
+
+        # Poi prova con proxy (IP di Webshare)
+        r2 = requests.get("https://api.ipify.org?format=json", proxies=get_proxies(), timeout=10, verify=False)
+        ip_proxy = r2.json().get("ip", "sconosciuto")
+        log.info(f"🔒 IP con proxy Webshare: {ip_proxy}")
+
+        if ip_railway != ip_proxy:
+            log.info("✅ Proxy funzionante! IP diversi confermati.")
+        else:
+            log.warning("⚠️ ATTENZIONE: IP uguale con e senza proxy — proxy NON attivo!")
+
+        return ip_railway
+    except Exception as e:
+        log.error(f"Errore recupero IP: {e}")
+        return None
+
 def validate_config():
     if not TELEGRAM_BOT_TOKEN:
         log.error("❌ TELEGRAM_BOT_TOKEN non impostato!")
@@ -421,6 +444,10 @@ if __name__ == "__main__":
     log.info(f"Ricerche: {[s['nome'] for s in SEARCHES]}")
     log.info(f"Intervallo: ogni {INTERVALLO_MINUTI} minuti")
     log.info("=" * 50)
+
+    ip = get_public_ip()
+    if ip:
+        log.info(f"➡️ Aggiungi questo IP su Webshare se non l'hai fatto: {ip}")
 
     send_startup_message()
     check_all()
