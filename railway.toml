@@ -2,4 +2,4 @@
 builder = "NIXPACKS"
 
 [deploy]
-startCommand = "python subito_bot.py"
+startCommand = "bash -c "python -m playwright install chromium && python subito_bot.py""
