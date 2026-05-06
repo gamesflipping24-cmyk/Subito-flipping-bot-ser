@@ -3,8 +3,11 @@ FROM python:3.11-slim
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install -r requirements.txt
 
-COPY subito_bot.py .
+# 🔥 install browsers
+RUN playwright install chromium
 
-CMD ["python", "-u", "subito_bot.py"]
+COPY . .
+
+CMD ["python", "subito_bot.py"]
