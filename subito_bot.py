@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Bot Telegram — Monitor eBay Italia per Flipping
-================================================
-- eBay Italia → richiesta diretta, nessun proxy necessario
-- Solo venditori privati, solo Italia, solo usato buono+
-- Monitora ogni 20 minuti
+Bot Telegram — Monitor Subito.it + eBay per Flipping
+=====================================================
+Usa Webshare Static Residential proxy per bypassare i blocchi.
+Monitora ogni 2 minuti su Subito.it ed eBay Italia.
 """
 
 import requests
@@ -13,8 +12,11 @@ import time
 import json
 import os
 import logging
+import warnings
 from bs4 import BeautifulSoup
 from urllib.parse import quote
+
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
 # ============================================================
 #  CONFIG
@@ -22,6 +24,12 @@ from urllib.parse import quote
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# Webshare Static Residential Proxy
+PROXY_HOST = os.environ.get("PROXY_HOST", "")
+PROXY_PORT = os.environ.get("PROXY_PORT", "")
+PROXY_USER = os.environ.get("PROXY_USER", "")
+PROXY_PASS = os.environ.get("PROXY_PASS", "")
 
 SEARCHES = [
     {
@@ -40,20 +48,18 @@ SEARCHES = [
     },
 ]
 
-# Frasi esatte che indicano vendita solo scatola/accessori
 TITOLI_ESCLUSI_ESATTI = [
     "solo scatola", "only box", "box only", "solo box",
     "solo manuale", "solo custodia", "solo cover",
     "solo caricatore", "solo alimentatore", "scatola vuota", "empty box",
 ]
 
-# Condizioni non accettate
 CONDIZIONI_ESCLUSE = [
     "for parts", "not working", "per ricambi",
     "non funzionante", "parts only", "da riparare", "broken",
 ]
 
-INTERVALLO_MINUTI = 20
+INTERVALLO_MINUTI = 2
 SEEN_FILE = "/tmp/seen_ids.json"
 
 # ============================================================
@@ -88,6 +94,14 @@ def save_seen(seen: set):
         log.error(f"Errore salvataggio seen: {e}")
 
 # ============================================================
+#  Proxy
+# ============================================================
+
+def get_proxies():
+    proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+    return {"http": proxy_url, "https": proxy_url}
+
+# ============================================================
 #  Filtro titoli
 # ============================================================
 
@@ -102,14 +116,83 @@ def titolo_escluso(title: str) -> bool:
     return False
 
 # ============================================================
-#  eBay Italia — richiesta diretta
+#  Subito.it
 # ============================================================
 
-EBAY_HEADERS = {
+HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "it-IT,it;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
+
+def fetch_subito(search: dict) -> list:
+    q = quote(search["query"])
+    url = f"https://www.subito.it/annunci/italia/vendita/?q={q}&ps={search['prezzo_min']}&pe={search['prezzo_max']}"
+    log.info(f"[{search['nome']}] Subito scraping...")
+
+    try:
+        resp = requests.get(url, headers=HEADERS, proxies=get_proxies(), timeout=30, verify=False)
+        resp.raise_for_status()
+    except Exception as e:
+        log.error(f"[{search['nome']}] Errore Subito: {e}")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    annunci = []
+
+    cards = soup.select("article[class*='item-card']")
+    if not cards:
+        cards = soup.select("div[class*='item-list'] article")
+
+    log.info(f"[{search['nome']}] Subito: {len(cards)} card trovate")
+
+    for card in cards:
+        try:
+            ad_id = card.get("data-item-id") or card.get("id") or ""
+            if not ad_id:
+                link_tag = card.select_one("a[href*='/annunci/']")
+                if link_tag:
+                    ad_id = link_tag["href"].split("-")[-1].rstrip("/")
+            if not ad_id:
+                continue
+
+            title_tag = card.select_one("h2,h3,[class*='title']")
+            title = title_tag.get_text(strip=True) if title_tag else "Senza titolo"
+
+            if titolo_escluso(title):
+                log.info(f"  ↳ [Subito] Escluso: {title}")
+                continue
+
+            price_tag = card.select_one("[class*='price']")
+            price_text = price_tag.get_text(strip=True) if price_tag else ""
+            price = parse_price(price_text)
+
+            link_tag = card.select_one("a[href]")
+            link = link_tag["href"] if link_tag else ""
+            if link and not link.startswith("http"):
+                link = "https://www.subito.it" + link
+
+            location_tag = card.select_one("[class*='town'],[class*='location'],[class*='city']")
+            location = location_tag.get_text(strip=True) if location_tag else ""
+
+            annunci.append({
+                "id":         f"subito_{ad_id}",
+                "title":      title,
+                "price":      price,
+                "price_text": price_text,
+                "link":       link,
+                "location":   location,
+                "source":     "SUBITO",
+                "condition":  "",
+            })
+        except Exception as e:
+            log.warning(f"Errore parsing Subito: {e}")
+
+    return annunci
+
+# ============================================================
+#  eBay Italia
+# ============================================================
 
 def fetch_ebay(search: dict) -> list:
     log.info(f"[{search['nome']}] eBay scraping...")
@@ -118,14 +201,14 @@ def fetch_ebay(search: dict) -> list:
     url = (
         f"https://www.ebay.it/sch/i.html?_nkw={q}"
         f"&_udlo={search['prezzo_min']}&_udhi={search['prezzo_max']}"
-        f"&LH_ItemCondition=3000"   # Usato
-        f"&LH_PrefLoc=1"            # Solo Italia
-        f"&LH_BAP=y"                # Solo privati
-        f"&_sop=10"                 # Più recenti prima
+        f"&LH_ItemCondition=3000"
+        f"&LH_PrefLoc=1"
+        f"&LH_BAP=y"
+        f"&_sop=10"
     )
 
     try:
-        resp = requests.get(url, headers=EBAY_HEADERS, timeout=20)
+        resp = requests.get(url, headers=HEADERS, proxies=get_proxies(), timeout=30, verify=False)
         resp.raise_for_status()
     except Exception as e:
         log.error(f"[{search['nome']}] Errore eBay: {e}")
@@ -162,7 +245,6 @@ def fetch_ebay(search: dict) -> list:
             condition = condition_tag.get_text(strip=True) if condition_tag else ""
 
             if any(c in condition.lower() for c in CONDIZIONI_ESCLUSE):
-                log.info(f"  ↳ [eBay] Escluso per condizione: {title}")
                 continue
 
             ad_id = link.split("itm/")[-1].split("?")[0] if "itm/" in link else title[:30]
@@ -178,7 +260,7 @@ def fetch_ebay(search: dict) -> list:
                 "condition":  condition,
             })
         except Exception as e:
-            log.warning(f"Errore parsing eBay item: {e}")
+            log.warning(f"Errore parsing eBay: {e}")
 
     log.info(f"[{search['nome']}] eBay: {len(annunci)} annunci dopo filtri")
     return annunci
@@ -235,6 +317,7 @@ def send_telegram(annuncio: dict, search: dict):
     price       = annuncio["price"]
     prezzo_txt  = annuncio["price_text"] or "Prezzo non indicato"
     luogo       = annuncio["location"] or "—"
+    source      = annuncio["source"]
     condition   = annuncio.get("condition", "")
     margine     = calcola_margine(price, search.get("prezzo_revend"))
     valutazione = valuta_affare(margine, search.get("prezzo_revend"))
@@ -248,7 +331,7 @@ def send_telegram(annuncio: dict, search: dict):
 
     text = (
         f"{valutazione}\n"
-        f"🔔 *{escape_md(search['nome'])}* — EBAY 🛒\n\n"
+        f"🔔 *{escape_md(search['nome'])}* — {source}\n\n"
         f"📦 *{escape_md(annuncio['title'])}*\n"
         f"💶 Prezzo: {escape_md(prezzo_txt)}\n"
         f"{margine_txt}\n"
@@ -264,7 +347,7 @@ def send_telegram(annuncio: dict, search: dict):
             timeout=10
         )
         resp.raise_for_status()
-        log.info(f"✅ Notifica: {annuncio['title']} — margine ~{margine}€")
+        log.info(f"✅ [{source}] Notifica: {annuncio['title']} — margine ~{margine}€")
     except Exception as e:
         log.error(f"❌ Errore Telegram: {e}")
 
@@ -274,9 +357,10 @@ def send_startup_message():
         for s in SEARCHES
     )
     text = (
-        f"🤖 *Bot Flipping aggiornato\\!*\n\n"
-        f"🛒 Monitorando eBay Italia ogni *{INTERVALLO_MINUTI} minuti*\n"
-        f"\\(solo privati, solo usato, solo Italia\\)\n\n"
+        f"🤖 *Bot Flipping avviato\\!*\n\n"
+        f"🎮 Monitorando ogni *{INTERVALLO_MINUTI} minuti*:\n"
+        f"📦 Subito\\.it\n"
+        f"🛒 eBay Italia\n\n"
         f"{lines}\n\n"
         f"Ti avviserò non appena trovo un affare\\! 🔥"
     )
@@ -298,7 +382,7 @@ def check_all():
     new_count = 0
 
     for search in SEARCHES:
-        annunci = fetch_ebay(search)
+        annunci = fetch_subito(search) + fetch_ebay(search)
 
         for ann in annunci:
             ad_id = f"{search['nome']}_{ann['id']}"
@@ -307,7 +391,7 @@ def check_all():
             if not passes_filter(ann, search):
                 seen.add(ad_id)
                 continue
-            log.info(f"  ✨ NUOVO: {ann['title']} — {ann['price_text']}")
+            log.info(f"  ✨ NUOVO [{ann['source']}]: {ann['title']} — {ann['price_text']}")
             send_telegram(ann, search)
             seen.add(ad_id)
             new_count += 1
@@ -325,11 +409,15 @@ def validate_config():
     if not TELEGRAM_CHAT_ID:
         log.error("❌ TELEGRAM_CHAT_ID non impostato!")
         exit(1)
+    if not PROXY_HOST:
+        log.error("❌ PROXY_HOST non impostato!")
+        exit(1)
 
 if __name__ == "__main__":
     log.info("=" * 50)
-    log.info("🎮 Bot Flipping avviato — eBay Italia")
+    log.info("🎮 Bot Flipping avviato — Subito + eBay via Webshare")
     validate_config()
+    log.info(f"Proxy: {PROXY_HOST}:{PROXY_PORT}")
     log.info(f"Ricerche: {[s['nome'] for s in SEARCHES]}")
     log.info(f"Intervallo: ogni {INTERVALLO_MINUTI} minuti")
     log.info("=" * 50)
