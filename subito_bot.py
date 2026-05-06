@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Bot Telegram — Monitor Subito.it + eBay per Flipping
-=====================================================
-Usa ScraperAPI per bypassare i blocchi di Subito.it ed eBay.
-Monitora ogni 5 minuti e invia notifiche Telegram con margine stimato.
+Bot Telegram — Monitor eBay Italia per Flipping
+================================================
+- eBay Italia → richiesta diretta, nessun proxy necessario
+- Solo venditori privati, solo Italia, solo usato buono+
+- Monitora ogni 20 minuti
 """
 
 import requests
@@ -21,7 +22,6 @@ from urllib.parse import quote
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
-SCRAPER_API_KEY    = os.environ.get("SCRAPER_API_KEY", "")
 
 SEARCHES = [
     {
@@ -40,34 +40,20 @@ SEARCHES = [
     },
 ]
 
-# Frasi ESATTE che indicano che vendono SOLO la scatola/accessori senza console
-# Usiamo frasi intere per evitare falsi positivi
+# Frasi esatte che indicano vendita solo scatola/accessori
 TITOLI_ESCLUSI_ESATTI = [
-    "solo scatola",
-    "only box",
-    "box only",
-    "solo box",
-    "solo manuale",
-    "solo custodia",
-    "solo cover",
-    "solo caricatore",
-    "solo alimentatore",
-    "scatola vuota",
-    "empty box",
+    "solo scatola", "only box", "box only", "solo box",
+    "solo manuale", "solo custodia", "solo cover",
+    "solo caricatore", "solo alimentatore", "scatola vuota", "empty box",
 ]
 
-# Parole che da SOLE indicano "per ricambi" o non funzionante
+# Condizioni non accettate
 CONDIZIONI_ESCLUSE = [
-    "for parts",
-    "not working",
-    "per ricambi",
-    "non funzionante",
-    "parts only",
-    "da riparare",
-    "broken",
+    "for parts", "not working", "per ricambi",
+    "non funzionante", "parts only", "da riparare", "broken",
 ]
 
-INTERVALLO_MINUTI = 5
+INTERVALLO_MINUTI = 20
 SEEN_FILE = "/tmp/seen_ids.json"
 
 # ============================================================
@@ -107,211 +93,98 @@ def save_seen(seen: set):
 
 def titolo_escluso(title: str) -> bool:
     title_lower = title.lower()
-
-    # Controlla frasi esatte (solo scatola, box only, ecc.)
     for frase in TITOLI_ESCLUSI_ESATTI:
         if frase in title_lower:
             return True
-
-    # Controlla condizioni non funzionante
     for cond in CONDIZIONI_ESCLUSE:
         if cond in title_lower:
             return True
-
     return False
 
 # ============================================================
-#  ScraperAPI — fetch generico per Subito
+#  eBay Italia — richiesta diretta
 # ============================================================
 
-def scraper_get(url: str):
-    proxy_url = f"http://scraperapi:{SCRAPER_API_KEY}@proxy-server.scraperapi.com:8001"
-    try:
-        resp = requests.get(
-            url,
-            proxies={"http": proxy_url, "https": proxy_url},
-            timeout=60,
-            verify=False
-        )
-        resp.raise_for_status()
-        return resp
-    except Exception as e:
-        log.error(f"ScraperAPI error: {e}")
-        return None
-
-# ============================================================
-#  Subito.it scraping via ScraperAPI
-# ============================================================
-
-def fetch_subito(search: dict) -> list:
-    q = quote(search["query"])
-    url = f"https://www.subito.it/annunci/italia/vendita/?q={q}&ps={search['prezzo_min']}&pe={search['prezzo_max']}"
-    log.info(f"[{search['nome']}] Subito scraping: {url}")
-
-    resp = scraper_get(url)
-    if not resp:
-        return []
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    annunci = []
-
-    cards = soup.select("article[class*='item-card']")
-    if not cards:
-        cards = soup.select("div[class*='item-list'] article")
-
-    log.info(f"[{search['nome']}] Subito: trovate {len(cards)} card")
-
-    for card in cards:
-        try:
-            ad_id = card.get("data-item-id") or card.get("id") or ""
-            if not ad_id:
-                link_tag = card.select_one("a[href*='/annunci/']")
-                if link_tag:
-                    ad_id = link_tag["href"].split("-")[-1].rstrip("/")
-            if not ad_id:
-                continue
-
-            title_tag = card.select_one("h2,h3,[class*='title']")
-            title = title_tag.get_text(strip=True) if title_tag else "Senza titolo"
-
-            # Filtro titolo anche su Subito
-            if titolo_escluso(title):
-                log.info(f"  ↳ [Subito] Escluso: {title}")
-                continue
-
-            price_tag = card.select_one("[class*='price']")
-            price_text = price_tag.get_text(strip=True) if price_tag else ""
-            price = parse_price(price_text)
-
-            link_tag = card.select_one("a[href]")
-            link = link_tag["href"] if link_tag else ""
-            if link and not link.startswith("http"):
-                link = "https://www.subito.it" + link
-
-            location_tag = card.select_one("[class*='town'],[class*='location'],[class*='city']")
-            location = location_tag.get_text(strip=True) if location_tag else ""
-
-            annunci.append({
-                "id":          f"subito_{ad_id}",
-                "title":       title,
-                "price":       price,
-                "price_text":  price_text,
-                "link":        link,
-                "location":    location,
-                "source":      "SUBITO",
-                "condition":   "",
-                "seller_type": "private",
-            })
-        except Exception as e:
-            log.warning(f"Errore parsing card Subito: {e}")
-
-    return annunci
-
-# ============================================================
-#  eBay.it scraping via ScraperAPI structured endpoint
-# ============================================================
+EBAY_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept-Language": "it-IT,it;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 
 def fetch_ebay(search: dict) -> list:
     log.info(f"[{search['nome']}] eBay scraping...")
 
+    q = quote(search["query"])
+    url = (
+        f"https://www.ebay.it/sch/i.html?_nkw={q}"
+        f"&_udlo={search['prezzo_min']}&_udhi={search['prezzo_max']}"
+        f"&LH_ItemCondition=3000"   # Usato
+        f"&LH_PrefLoc=1"            # Solo Italia
+        f"&LH_BAP=y"                # Solo privati
+        f"&_sop=10"                 # Più recenti prima
+    )
+
     try:
-        resp = requests.get(
-            "https://api.scraperapi.com/structured/ebay/search",
-            params={
-                "api_key":      SCRAPER_API_KEY,
-                "query":        search["query"],
-                "country_code": "it",
-                "tld":          "it",
-                "sort":         "newly_listed",
-                "condition":    "used",
-                "pricing_min":  search["prezzo_min"],
-                "pricing_max":  search["prezzo_max"],
-            },
-            timeout=60
-        )
+        resp = requests.get(url, headers=EBAY_HEADERS, timeout=20)
         resp.raise_for_status()
-        data = resp.json()
     except Exception as e:
-        log.error(f"[{search['nome']}] Errore eBay ScraperAPI: {e}")
+        log.error(f"[{search['nome']}] Errore eBay: {e}")
         return []
 
-    items = data if isinstance(data, list) else data.get("results", data.get("organic_results", []))
-    log.info(f"[{search['nome']}] eBay: trovati {len(items)} annunci (pre-filtro)")
-
+    soup = BeautifulSoup(resp.text, "html.parser")
     annunci = []
+    items = soup.select("li.s-item")
+    log.info(f"[{search['nome']}] eBay: {len(items)} annunci trovati (pre-filtro)")
+
     for item in items:
         try:
-            title      = item.get("product_title") or item.get("title") or "Senza titolo"
-            link       = item.get("product_url") or item.get("link") or ""
-            condition  = (item.get("condition") or "").lower()
-            location   = item.get("item_location") or item.get("location") or ""
-            price_data = item.get("item_price") or {}
+            title_tag = item.select_one(".s-item__title")
+            title = title_tag.get_text(strip=True) if title_tag else ""
 
-            if isinstance(price_data, dict):
-                price = float(price_data.get("value") or price_data.get("from", {}).get("value") or 0)
-            elif isinstance(price_data, (int, float)):
-                price = float(price_data)
-            else:
-                price = parse_price(str(price_data))
+            if not title or "shop on ebay" in title.lower() or "new listing" in title.lower():
+                continue
 
-            price_text = f"{int(price)} €" if price else "Prezzo non indicato"
-            ad_id = link.split("/")[-1] if link else title[:30]
-
-            # Filtro titolo (solo scatola, per ricambi, ecc.)
             if titolo_escluso(title):
-                log.info(f"  ↳ [eBay] Escluso per titolo: {title}")
+                log.info(f"  ↳ [eBay] Escluso: {title}")
                 continue
 
-            # Filtro condizione
-            if any(c in condition for c in CONDIZIONI_ESCLUSE):
-                log.info(f"  ↳ [eBay] Escluso per condizione '{condition}': {title}")
+            link_tag = item.select_one("a.s-item__link")
+            link = link_tag["href"] if link_tag else ""
+
+            price_tag = item.select_one(".s-item__price")
+            price_text = price_tag.get_text(strip=True) if price_tag else ""
+            price = parse_price(price_text)
+
+            location_tag = item.select_one(".s-item__location")
+            location = location_tag.get_text(strip=True).replace("Da ", "") if location_tag else "Italia"
+
+            condition_tag = item.select_one(".SECONDARY_INFO")
+            condition = condition_tag.get_text(strip=True) if condition_tag else ""
+
+            if any(c in condition.lower() for c in CONDIZIONI_ESCLUSE):
+                log.info(f"  ↳ [eBay] Escluso per condizione: {title}")
                 continue
 
-            # Filtro: solo Italia
-            if location and not location_is_italy(location):
-                log.info(f"  ↳ [eBay] Escluso per posizione '{location}': {title}")
-                continue
-
-            # Filtro venditore professionale
-            seller_type = detect_seller_type(item)
-            if seller_type == "professional":
-                log.info(f"  ↳ [eBay] Escluso venditore pro: {title}")
-                continue
+            ad_id = link.split("itm/")[-1].split("?")[0] if "itm/" in link else title[:30]
 
             annunci.append({
-                "id":          f"ebay_{ad_id}",
-                "title":       title,
-                "price":       price if price else None,
-                "price_text":  price_text,
-                "link":        link,
-                "location":    location or "eBay Italia",
-                "source":      "EBAY",
-                "condition":   condition,
-                "seller_type": seller_type,
+                "id":         f"ebay_{ad_id}",
+                "title":      title,
+                "price":      price,
+                "price_text": price_text,
+                "link":       link,
+                "location":   location,
+                "source":     "EBAY",
+                "condition":  condition,
             })
         except Exception as e:
-            log.warning(f"Errore parsing item eBay: {e}")
+            log.warning(f"Errore parsing eBay item: {e}")
 
     log.info(f"[{search['nome']}] eBay: {len(annunci)} annunci dopo filtri")
     return annunci
 
-def location_is_italy(location: str) -> bool:
-    italian_indicators = [
-        "italy", "italia", "milan", "milano", "roma", "rome", "napoli",
-        "torino", "bologna", "firenze", "venezia", "genova", "palermo",
-        "bari", "catania", "sicilia", "sardegna", "it",
-    ]
-    loc_lower = location.lower()
-    return any(ind in loc_lower for ind in italian_indicators)
-
-def detect_seller_type(item: dict) -> str:
-    seller_rating = item.get("seller_rating_count", 0) or 0
-    if isinstance(seller_rating, (int, float)) and seller_rating > 500:
-        return "professional"
-    return "private"
-
 # ============================================================
-#  Utilità prezzi
+#  Utilità
 # ============================================================
 
 def parse_price(text: str):
@@ -362,27 +235,25 @@ def send_telegram(annuncio: dict, search: dict):
     price       = annuncio["price"]
     prezzo_txt  = annuncio["price_text"] or "Prezzo non indicato"
     luogo       = annuncio["location"] or "—"
-    source      = annuncio["source"]
     condition   = annuncio.get("condition", "")
     margine     = calcola_margine(price, search.get("prezzo_revend"))
     valutazione = valuta_affare(margine, search.get("prezzo_revend"))
-    seller_tag  = "👤 Privato" if annuncio.get("seller_type") == "private" else "🏪 Venditore"
 
     if margine is not None:
         margine_txt = f"💰 Margine stimato: ~{int(margine)}€ \\(rivendi a ~{search['prezzo_revend']}€\\)"
     else:
         margine_txt = "💰 Margine: non calcolabile"
 
-    condition_txt = f"\n🔧 Condizione: {escape_md(condition)}" if condition else ""
+    condition_txt = f"\n🔧 {escape_md(condition)}" if condition else ""
 
     text = (
         f"{valutazione}\n"
-        f"🔔 *{escape_md(search['nome'])}* — {source}\n\n"
+        f"🔔 *{escape_md(search['nome'])}* — EBAY 🛒\n\n"
         f"📦 *{escape_md(annuncio['title'])}*\n"
         f"💶 Prezzo: {escape_md(prezzo_txt)}\n"
         f"{margine_txt}\n"
-        f"📍 {escape_md(luogo)}\n"
-        f"{seller_tag}{condition_txt}\n\n"
+        f"📍 {escape_md(luogo)}"
+        f"{condition_txt}\n\n"
         f"[👉 Vedi annuncio]({annuncio['link']})"
     )
 
@@ -393,7 +264,7 @@ def send_telegram(annuncio: dict, search: dict):
             timeout=10
         )
         resp.raise_for_status()
-        log.info(f"✅ [{source}] Notifica: {annuncio['title']} — margine ~{margine}€")
+        log.info(f"✅ Notifica: {annuncio['title']} — margine ~{margine}€")
     except Exception as e:
         log.error(f"❌ Errore Telegram: {e}")
 
@@ -404,9 +275,8 @@ def send_startup_message():
     )
     text = (
         f"🤖 *Bot Flipping aggiornato\\!*\n\n"
-        f"🎮 Monitorando ogni *{INTERVALLO_MINUTI} minuti* su:\n"
-        f"📦 Subito\\.it\n"
-        f"🛒 eBay Italia \\(solo privati, solo usato buono\\+\\)\n\n"
+        f"🛒 Monitorando eBay Italia ogni *{INTERVALLO_MINUTI} minuti*\n"
+        f"\\(solo privati, solo usato, solo Italia\\)\n\n"
         f"{lines}\n\n"
         f"Ti avviserò non appena trovo un affare\\! 🔥"
     )
@@ -428,7 +298,7 @@ def check_all():
     new_count = 0
 
     for search in SEARCHES:
-        annunci = fetch_subito(search) + fetch_ebay(search)
+        annunci = fetch_ebay(search)
 
         for ann in annunci:
             ad_id = f"{search['nome']}_{ann['id']}"
@@ -437,7 +307,7 @@ def check_all():
             if not passes_filter(ann, search):
                 seen.add(ad_id)
                 continue
-            log.info(f"  ✨ NUOVO [{ann['source']}]: {ann['title']} — {ann['price_text']}")
+            log.info(f"  ✨ NUOVO: {ann['title']} — {ann['price_text']}")
             send_telegram(ann, search)
             seen.add(ad_id)
             new_count += 1
@@ -455,13 +325,10 @@ def validate_config():
     if not TELEGRAM_CHAT_ID:
         log.error("❌ TELEGRAM_CHAT_ID non impostato!")
         exit(1)
-    if not SCRAPER_API_KEY:
-        log.error("❌ SCRAPER_API_KEY non impostato!")
-        exit(1)
 
 if __name__ == "__main__":
     log.info("=" * 50)
-    log.info("🎮 Bot Flipping avviato — Subito + eBay")
+    log.info("🎮 Bot Flipping avviato — eBay Italia")
     validate_config()
     log.info(f"Ricerche: {[s['nome'] for s in SEARCHES]}")
     log.info(f"Intervallo: ogni {INTERVALLO_MINUTI} minuti")
