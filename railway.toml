@@ -1,6 +1,5 @@
 [build]
-builder = "dockerfile"
+builder = "NIXPACKS"
 
 [deploy]
-restartPolicyType = "always"
-restartPolicyMaxRetries = 10
+startCommand = "python subito_bot.py"
